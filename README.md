@@ -146,7 +146,7 @@ If you use this code in your research, please cite:
   title={Climate-Resilient Evaluation of Alfalfa Seed Maturity Using an Earth Mover's Distance-Guided Multispectral Imaging Framework},
   author={Zhicheng Jia},
   journal={Under Peer Review},
-  year={2024}
+  year={2026}
 }
 ```
 
