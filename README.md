@@ -15,28 +15,82 @@ This repository implements an EMD-guided domain adaptation framework that uses A
 
 ## Quick Start
 
-### Basic Usage
+### Step 1: Compute EMD Distance
 
 ```bash
+# Compute EMD from source (2023) to target (2022)
+python emd_calculator.py \
+    --source-data path/to/seed_data_2023.npz \
+    --target-data path/to/seed_data_2022.npz \
+    --model-path path/to/pretrained_model.pt \
+    --output-path emd_2023_to_2022.json
+
+# Compute EMD from source (2023) to target (2024)
+python emd_calculator.py \
+    --source-data path/to/seed_data_2023.npz \
+    --target-data path/to/seed_data_2024.npz \
+    --model-path path/to/pretrained_model.pt \
+    --output-path emd_2023_to_2024.json
+```
+
+### Step 2: Domain Adaptation
+
+```bash
+# Basic usage
 python domain_adaptation.py \
-    --source-2022-data path/to/2022_data.npz \
-    --source-2024-data path/to/2024_data.npz \
-    --pretrained-model path/to/pretrained_model.pt
+    --source-model path/to/pretrained_model.pt \
+    --target-data path/to/target_data.npz
+
+# With precomputed EMD file
+python domain_adaptation.py \
+    --source-model path/to/pretrained_model.pt \
+    --target-data path/to/seed_data_2022.npz \
+    --emd-file emd_2023_to_2022.json
 ```
 
 ### Full Configuration
 
 ```bash
 python domain_adaptation.py \
-    --source-2022-data path/to/2022_data.npz \
-    --source-2024-data path/to/2024_data.npz \
-    --pretrained-model path/to/pretrained_model.pt \
-    --samples-per-class-list 50 100 200 \
+    --source-model path/to/pretrained_model.pt \
+    --target-data path/to/target_data.npz \
+    --emd-file path/to/emd_analysis.json \
+    --num-classes 5 \
+    --num-bands 19 \
+    --samples-list 50 100 200 \
     --num-runs 3 \
     --batch-size 8 \
     --lr 0.0001 \
-    --output-dir ./results
+    --output-dir ./results \
+    --seed 42
 ```
+
+## Arguments
+
+### emd_calculator.py
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--source-data` | Source domain data path (.npz) | Yes |
+| `--target-data` | Target domain data path (.npz) | Yes |
+| `--model-path` | Pretrained model path (.pt) | Yes |
+| `--output-path` | Output JSON path | No (default: emd_analysis.json) |
+
+### domain_adaptation.py
+
+| Argument | Description | Required |
+|----------|-------------|----------|
+| `--source-model` | Pretrained source model path (.pt) | Yes |
+| `--target-data` | Target domain data path (.npz) | Yes |
+| `--emd-file` | Precomputed EMD file path (.json) | No |
+| `--num-classes` | Number of classes | No (default: 5) |
+| `--num-bands` | Number of spectral bands | No (default: 19) |
+| `--samples-list` | Samples per class to test | No (default: 50 100 200) |
+| `--num-runs` | Runs per experiment | No (default: 3) |
+| `--batch-size` | Batch size | No (default: 8) |
+| `--lr` | Learning rate | No (default: 0.0001) |
+| `--output-dir` | Output directory | No (default: ./results) |
+| `--seed` | Random seed | No (default: 42) |
 
 ## File Structure
 
@@ -44,16 +98,16 @@ python domain_adaptation.py \
 ├── emd_calculator.py          # EMD distance computation
 ├── adaptive_bn.py             # EMD-guided AdaBN implementation
 ├── model_components.py        # Model architecture with AdaBN
-├── domain_adaptation.py       # Main training script
+├── domain_adaptation.py       # Main adaptation script
 └── README.md
 ```
 
 ## Method
 
-1. **EMD Computation**: Calculate Earth Mover's Distance between source and target feature distributions
-2. **Adaptive Strategy**: Use EMD values to determine which layers need AdaBN
+1. **EMD Computation**: Calculate Earth Mover's Distance between source and target feature distributions at each layer
+2. **Adaptive Strategy**: Use EMD values to determine which layers need AdaBN (threshold-based)
 3. **Selective Adaptation**: Apply different adaptation strengths based on domain shift magnitude
-4. **Progressive Fine-tuning**: Intelligent layer unfreezing guided by EMD analysis
+4. **Progressive Fine-tuning**: Classifier fine-tuning with frozen backbone
 
 ## Requirements
 
@@ -73,15 +127,14 @@ pip install torch torchvision numpy scipy scikit-learn
 ## Data Format
 
 Input data should be in NPZ format containing:
-- Multispectral images: `[N, C, H, W]` format
+- Multispectral images: `[N, C, H, W]` or `[N, H, W, C]` format (auto-converted)
 - Labels: `[N,]` format
 
 ## Results
 
 The framework generates comprehensive results including:
-- Performance metrics (accuracy, F1-score, kappa)
-- Training curves and confusion matrices
-- EMD analysis reports
+- Performance metrics (accuracy, F1-score)
+- EMD analysis reports (JSON)
 - Detailed experimental logs
 
 ## Citation
