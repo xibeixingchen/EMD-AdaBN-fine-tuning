@@ -43,71 +43,6 @@ python domain_adaptation.py \
     --emd-file emd_2023_to_2022.json
 ```
 
-#### Optimized Configuration (Recommended for 100 samples → 90% accuracy)
-```bash
-python domain_adaptation.py \
-    --source-model path/to/pretrained_model.pt \
-    --target-data path/to/seed_data_2022.npz \
-    --emd-file emd_2023_to_2022.json \
-    --num-classes 5 \
-    --num-bands 19 \
-    --samples-list 50 100 200 \
-    --num-runs 3 \
-    --batch-size 16 \
-    --lr 0.0002 \
-    --emd-threshold 3.5 \
-    --emd-linear-factor 0.35 \
-    --emd-max-strength 1.0 \
-    --adabn-rounds 10 \
-    --adabn-batches 12 \
-    --ft-lr-multiplier 5.0 \
-    --ft-stage1-epochs 10 \
-    --ft-stage2-epochs 15 \
-    --ft-stage3-epochs 15 \
-    --weight-decay 0.01 \
-    --label-smoothing 0.15 \
-    --gradient-clip 0.5 \
-    --output-dir ./results \
-    --seed 42
-```
-
-#### Conservative Configuration (For preventing overfitting)
-```bash
-python domain_adaptation.py \
-    --source-model path/to/pretrained_model.pt \
-    --target-data path/to/target_data.npz \
-    --emd-file emd_analysis.json \
-    --emd-threshold 4.0 \
-    --emd-linear-factor 0.30 \
-    --emd-max-strength 0.95 \
-    --adabn-rounds 10 \
-    --adabn-batches 10 \
-    --ft-lr-multiplier 4.0 \
-    --ft-stage1-epochs 8 \
-    --ft-stage2-epochs 12 \
-    --ft-stage3-epochs 12 \
-    --weight-decay 0.015 \
-    --label-smoothing 0.20
-```
-
-#### Aggressive Configuration (For maximum adaptation)
-```bash
-python domain_adaptation.py \
-    --source-model path/to/pretrained_model.pt \
-    --target-data path/to/target_data.npz \
-    --emd-file emd_analysis.json \
-    --emd-threshold 3.0 \
-    --emd-linear-factor 0.40 \
-    --emd-max-strength 1.0 \
-    --adabn-rounds 12 \
-    --adabn-batches 15 \
-    --ft-lr-multiplier 6.0 \
-    --ft-stage1-epochs 12 \
-    --ft-stage2-epochs 18 \
-    --ft-stage3-epochs 18 \
-    --weight-decay 0.008
-```
-
 ## Arguments
 
 ### emd_calculator.py
@@ -214,55 +149,6 @@ python domain_adaptation.py \
 └── README.md                  # This file
 ```
 
-## Method Details
-
-### 1. EMD Computation
-Calculate Earth Mover's Distance between source and target feature distributions at each network layer:
-```
-EMD(P_S^l, P_T^l) = inf_{γ∈Π(P_S^l, P_T^l)} E_{(x,y)~γ}[||x-y||]
-```
-
-Layers measured:
-- `input_normalized`: Input after batch normalization
-- `spectral_attended`: After spectral attention
-- `cnn_features`: After 3D CNN backbone
-- `spatial_features`: After spatial attention processor
-- `fused_features`: Concatenated CNN + spatial features
-- `pooled_features`: After global pooling
-
-### 2. EMD-Guided Adaptive Strategy
-Use EMD values to determine adaptation strategy:
-```python
-if EMD_layer > emd_threshold:
-    α = min(emd_max_strength, emd_linear_factor × EMD_layer)
-    Apply AdaBN with strength α
-else:
-    Skip adaptation (preserve source features)
-```
-
-**Example** with default parameters (threshold=3.5, linear_factor=0.35):
-- `spatial_features` (EMD=17.59): α = min(1.0, 0.35×17.59) = 1.0 → **Strong adaptation**
-- `cnn_features` (EMD=1.82): α = 0 (below threshold) → **Skip**
-- `pooled_features` (EMD=0.68): α = 0 (below threshold) → **Skip**
-
-### 3. Progressive Fine-tuning
-Three-stage unfreezing strategy to prevent catastrophic forgetting:
-```
-Stage 1 (10 epochs):  [Classifier] ← High LR (lr × 5.0)
-Stage 2 (15 epochs):  [Classifier + Spatial] ← Medium LR (lr × 4.0)  
-Stage 3 (15 epochs):  [All Layers] ← Low LR with cosine annealing
-```
-
-### 4. Adaptive Batch Normalization
-Update BN statistics using weighted combination:
-```python
-μ_adapted = (1-α)·μ_source + α·μ_target
-σ²_adapted = (1-α)·σ²_source + α·σ²_target
-```
-
-where α is dynamically determined by EMD values.
-
-
 
 ## Requirements
 ```
@@ -304,23 +190,6 @@ results/
 │   └── adaptation.log         # Full training logs
 ```
 
-**results.json Structure**:
-```json
-{
-  "results": [
-    {
-      "samples_per_class": 100,
-      "accuracy_mean": 0.9012,
-      "accuracy_std": 0.0089,
-      "f1_mean": 0.8987,
-      "f1_std": 0.0095,
-      "num_runs": 3,
-      "individual_runs": [...]
-    }
-  ],
-  "config": {...}
-}
-```
 
 ## License
 MIT License
