@@ -117,9 +117,6 @@ python domain_adaptation.py \
 | `--ft-stage3-epochs` | int | `15` | **Stage 3 epochs** (all layers). Range: [10, 20] |
 
 **Progressive Fine-tuning Stages**:
-- **Stage 1**: Unfreeze only classifier head → adapt high-level features
-- **Stage 2**: Unfreeze classifier + spatial_processor → adapt spatial representations  
-- **Stage 3**: Unfreeze all layers with cosine annealing → final global adaptation
 
 #### Training Hyperparameters
 | Argument | Type | Default | Description |
@@ -138,16 +135,6 @@ python domain_adaptation.py \
 | `--output-dir` | str | `./results` | Output directory for results and logs |
 | `--seed` | int | `42` | Random seed for reproducibility |
 
-## File Structure
-```
-├── emd_calculator.py          # EMD distance computation between domains
-├── adaptive_bn.py             # EMD-guided AdaBN implementation
-├── model_components.py        # SpectralNet with integrated AdaBN layers
-├── domain_adaptation.py       # Main adaptation script (optimized version)
-├── run_optimized_adaptation.sh # Shell script for easy execution
-├── PARAMS.md                  # Parameter optimization guide
-└── README.md                  # This file
-```
 
 
 ## Requirements
