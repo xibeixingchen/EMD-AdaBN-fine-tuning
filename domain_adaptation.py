@@ -1,36 +1,29 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""
-EMD指导的域适应主脚本
-整合EMD计算、AdaBN和微调的完整域适应系统
-"""
 
 import os
-import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import json
 import logging
 import argparse
 from datetime import datetime
-import time
 import random
-from sklearn.metrics import accuracy_score, f1_score, classification_report
+from sklearn.metrics import accuracy_score, f1_score
 import warnings
 
-from adaptive_bn import EMDGuidedConfig, EMDAdaBN2d, EMDAdaBN3d, EMDAdaBN1d
-from model_components import SpectralNet
-from emd_calculator import EMDCalculator
+from adaptive_bn import EMDGuidedConfig, EMDAdaBN1d, EMDAdaBN2d, EMDAdaBN3d
+from model_components import SpectralNet, load_pretrained_weights
 
 warnings.filterwarnings('ignore')
 
 
 def set_seed(seed=42):
-    """设置随机种子"""
+    """Set random seed"""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
@@ -40,7 +33,7 @@ def set_seed(seed=42):
 
 
 def setup_logging(log_file):
-    """设置日志"""
+    """Configure logging"""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -52,12 +45,11 @@ def setup_logging(log_file):
 
 
 class SpectralDataset(Dataset):
-    """光谱数据集"""
+    """Spectral image dataset"""
     
-    def __init__(self, X_spectral, y, is_training=True):
+    def __init__(self, X_spectral, y):
         self.X_spectral = X_spectral.float()
         self.y = self._process_labels(y) if y is not None else None
-        self.is_training = is_training
         
     def _process_labels(self, y):
         if isinstance(y, np.ndarray):
@@ -70,51 +62,61 @@ class SpectralDataset(Dataset):
         return len(self.X_spectral)
     
     def __getitem__(self, idx):
-        spectral_img = self.X_spectral[idx].clone()
         if self.y is not None:
-            return spectral_img, self.y[idx].clone()
-        else:
-            return spectral_img, torch.tensor(-1)
+            return self.X_spectral[idx], self.y[idx]
+        return self.X_spectral[idx], torch.tensor(-1)
+
 
 
 def load_npz_dataset(file_path):
-    """加载NPZ数据集"""
+    """Load NPZ or PT dataset"""
     try:
-        logging.info(f"加载数据集: {file_path}")
-        data = np.load(file_path, allow_pickle=True)
+        logging.info(f"Loading: {file_path}")
         
-        # 查找光谱数据和标签
+        if file_path.endswith('.pt'):
+            data = torch.load(file_path)
+            spectral_tensor = data['spectral']
+            labels_tensor = data['labels']
+            
+            if not isinstance(spectral_tensor, torch.Tensor):
+                spectral_tensor = torch.from_numpy(spectral_tensor).float()
+            if not isinstance(labels_tensor, torch.Tensor):
+                labels_tensor = torch.from_numpy(labels_tensor).long()
+            
+            logging.info(f"Loaded: {spectral_tensor.shape}")
+            return spectral_tensor, labels_tensor
+        
+        data = np.load(file_path, allow_pickle=True, mmap_mode='r')
+        
         spectral_data = None
         labels_data = None
         
         for key in data.keys():
-            if 'spectral' in key.lower() or 'hyper' in key.lower() or key == 'X':
+            if key in ['X', 'spectral'] or 'spectral' in key.lower():
                 spectral_data = data[key]
-            elif 'label' in key.lower() or 'target' in key.lower() or key == 'y':
+            elif key in ['y', 'labels'] or 'label' in key.lower():
                 labels_data = data[key]
         
         if spectral_data is None or labels_data is None:
-            raise ValueError("未找到必要的数据")
+            raise ValueError(f"Data not found. Keys: {list(data.keys())}")
         
-        spectral_tensor = torch.from_numpy(spectral_data).float()
-        labels_tensor = torch.from_numpy(labels_data)
+        logging.info("Loading to memory...")
+        spectral_tensor = torch.from_numpy(np.array(spectral_data)).float()
+        labels_tensor = torch.from_numpy(np.array(labels_data))
         
-        # 格式转换 [N, H, W, C] -> [N, C, H, W]
-        if len(spectral_tensor.shape) == 4 and spectral_tensor.shape[1] > spectral_tensor.shape[3]:
-            spectral_tensor = spectral_tensor.permute(0, 3, 1, 2)
-        
-        logging.info(f"数据集加载成功: {spectral_tensor.shape}")
+        logging.info(f"Loaded: {spectral_tensor.shape}")
         return spectral_tensor, labels_tensor
         
     except Exception as e:
-        logging.error(f"加载数据集失败: {str(e)}")
+        logging.error(f"Load failed: {e}")
         return None, None
 
 
 class FewShotSampler:
-    """小样本采样器"""
+    """Few-shot data sampler"""
     
-    def __init__(self, X, y, samples_per_class, test_samples_per_class=200, num_classes=5, seed=42):
+    def __init__(self, X, y, samples_per_class, test_samples_per_class=200,
+                 num_classes=5, seed=42):
         self.X = X
         self.y = y
         self.samples_per_class = samples_per_class
@@ -122,8 +124,8 @@ class FewShotSampler:
         self.num_classes = num_classes
         self.seed = seed
         
-    def sample_data(self):
-        """采样训练和测试数据"""
+    def sample(self):
+        """Sample train and test data"""
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
         
@@ -134,312 +136,331 @@ class FewShotSampler:
         train_indices = []
         test_indices = []
         
-        for class_label in range(self.num_classes):
-            class_indices = torch.where(labels == class_label)[0]
-            
-            if len(class_indices) == 0:
+        for cls in range(self.num_classes):
+            cls_idx = torch.where(labels == cls)[0]
+            if len(cls_idx) == 0:
                 continue
             
-            shuffled_indices = class_indices[torch.randperm(len(class_indices))]
+            perm = cls_idx[torch.randperm(len(cls_idx))]
             
-            # 训练样本
-            train_count = min(self.samples_per_class, len(shuffled_indices))
-            train_class_indices = shuffled_indices[:train_count]
-            train_indices.extend(train_class_indices.tolist())
+            # Train
+            n_train = min(self.samples_per_class, len(perm))
+            train_indices.extend(perm[:n_train].tolist())
             
-            # 测试样本
-            remaining_indices = shuffled_indices[train_count:]
-            test_count = min(self.test_samples_per_class, len(remaining_indices))
-            
-            if test_count > 0:
-                test_class_indices = remaining_indices[:test_count]
-                test_indices.extend(test_class_indices.tolist())
+            # Test
+            remaining = perm[n_train:]
+            n_test = min(self.test_samples_per_class, len(remaining))
+            if n_test > 0:
+                test_indices.extend(remaining[:n_test].tolist())
         
-        train_indices = torch.tensor(train_indices)
-        test_indices = torch.tensor(test_indices)
+        train_idx = torch.tensor(train_indices)
+        test_idx = torch.tensor(test_indices)
         
-        train_data = {
-            'spectral': self.X[train_indices],
-            'labels': labels[train_indices]
-        }
-        
+        train_data = {'spectral': self.X[train_idx], 'labels': labels[train_idx]}
         test_data = None
-        if len(test_indices) > 0:
-            test_data = {
-                'spectral': self.X[test_indices],
-                'labels': labels[test_indices]
-            }
+        if len(test_idx) > 0:
+            test_data = {'spectral': self.X[test_idx], 'labels': labels[test_idx]}
         
         return train_data, test_data
 
 
 class DomainAdapter:
-    """域适应器"""
+    """Domain adaptation controller - OPTIMIZED"""
     
     def __init__(self, args):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.emd_config = EMDGuidedConfig(emd_threshold=1.5, linear_factor=0.15, max_strength=0.8)
         
-        logging.info(f"使用设备: {self.device}")
         
-    def compute_emd_if_needed(self, source_data, target_data):
-        """如果需要，计算EMD距离"""
-        emd_file = f"emd_analysis_{int(time.time())}.json"
+        self.emd_config = EMDGuidedConfig(
+            emd_threshold=args.emd_threshold,      
+            linear_factor=args.emd_linear_factor,  
+            max_strength=args.emd_max_strength     
+        )
+        logging.info(f"Device: {self.device}")
+        logging.info(f"EMD Config: threshold={args.emd_threshold}, "
+                    f"linear_factor={args.emd_linear_factor}, "
+                    f"max_strength={args.emd_max_strength}")
         
-        # 如果没有提供EMD文件，则计算EMD
-        if not hasattr(self.args, 'emd_analysis_file') or not os.path.exists(self.args.emd_analysis_file):
-            logging.info("计算EMD距离...")
-            
-            calculator = EMDCalculator(self.args.pretrained_model)
-            emd_results = calculator.compute_dataset_emd(source_data, target_data, emd_file)
-            
-            if emd_results:
-                return emd_results['emd_results']
-            else:
-                logging.warning("EMD计算失败，使用默认值")
-                return self._get_default_emd_values()
-        else:
-            # 加载现有EMD文件
+    def load_emd_values(self):
+        """Load EMD values from file or use defaults"""
+        if self.args.emd_file and os.path.exists(self.args.emd_file):
             try:
-                with open(self.args.emd_analysis_file, 'r', encoding='utf-8') as f:
+                with open(self.args.emd_file, 'r', encoding='utf-8') as f:
                     emd_data = json.load(f)
                 
-                if 'emd_results' in emd_data:
-                    # 从复杂结构中提取EMD值
-                    for key, value in emd_data['emd_results'].items():
-                        if isinstance(value, dict):
-                            return {k: v['emd_distance'] if isinstance(v, dict) and 'emd_distance' in v else v 
-                                   for k, v in value.items()}
-                    
-                return emd_data.get('emd_results', self._get_default_emd_values())
+                emd_results = emd_data.get('emd_results', {})
+                emd_values = {}
+                
+                for k, v in emd_results.items():
+                    if isinstance(v, dict) and 'emd_distance' in v:
+                        emd_values[k] = v['emd_distance']
+                    else:
+                        emd_values[k] = float(v)
+                
+                logging.info(f"Loaded EMD from {self.args.emd_file}")
+                
+              
+                logging.info("Layer adaptation strengths:")
+                for layer, emd in sorted(emd_values.items(), key=lambda x: x[1], reverse=True):
+                    strength = min(1.0, self.args.emd_linear_factor * emd)
+                    status = "ADAPT" if emd > self.args.emd_threshold else "SKIP"
+                    logging.info(f"  {layer:20s}: EMD={emd:6.2f}, α={strength:.3f} [{status}]")
+                
+                return emd_values
                 
             except Exception as e:
-                logging.error(f"加载EMD文件失败: {e}")
-                return self._get_default_emd_values()
-    
-    def _get_default_emd_values(self):
-        """获取默认EMD值"""
+                logging.warning(f"Failed to load EMD file: {e}")
+        
+        # Default values
         return {
             'input_normalized': 1.0,
             'spectral_attended': 2.5,
             'cnn_features': 3.2,
             'spatial_features': 4.1,
+            'fused_features': 3.5,
             'pooled_features': 5.8
         }
     
-    def load_pretrained_model(self):
-        """加载预训练模型"""
+    def load_source_model(self):
+        """Load pretrained source model"""
         try:
-            checkpoint = torch.load(self.args.pretrained_model, map_location=self.device)
+            checkpoint = torch.load(self.args.source_model, map_location=self.device, 
+                                   weights_only=False)
             
-            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
+            config = checkpoint.get('config', {
+                'feature_dim': 256,
+                'dropout_rate': 0.15,
+                'spectral_attention_reduction': 8,
+                'spatial_attention_heads': 8
+            })
             
-            # 创建模型
             model = SpectralNet(
                 num_bands=self.args.num_bands,
                 num_classes=self.args.num_classes,
-                feature_dim=256,
+                config=config,
                 emd_config=self.emd_config
             )
             
-            # 过滤和加载权重
-            model_dict = model.state_dict()
-            filtered_state_dict = {}
-            
-            for k, v in state_dict.items():
-                # 跳过分类器层
-                if 'classifier' in k:
-                    continue
-                    
-                if k in model_dict and model_dict[k].shape == v.shape:
-                    filtered_state_dict[k] = v
-            
-            model.load_state_dict(filtered_state_dict, strict=False)
-            
-            # 重新初始化分类器
-            for name, module in model.named_modules():
-                if 'classifier' in name and isinstance(module, nn.Linear):
-                    nn.init.normal_(module.weight, 0, 0.001)
-                    if module.bias is not None:
-                        nn.init.constant_(module.bias, 0)
+            loaded, total = load_pretrained_weights(model, self.args.source_model, self.device)
+            logging.info(f"Loaded {loaded}/{total} parameters")
             
             model.to(self.device)
+            model.save_source_statistics()
             
-            # 保存源域统计量
-            with torch.no_grad():
-                for module in model.modules():
-                    if isinstance(module, (EMDAdaBN2d, EMDAdaBN3d, EMDAdaBN1d)):
-                        if module.track_running_stats:
-                            module.source_mean.copy_(module.running_mean)
-                            module.source_var.copy_(module.running_var)
-            
-            logging.info("预训练模型加载成功")
+            logging.info("Source model loaded")
             return model
             
         except Exception as e:
-            logging.error(f"预训练模型加载失败: {e}")
+            logging.error(f"Failed to load model: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def adaptive_alignment(self, model, target_loader):
-        """自适应对齐"""
+        """Adaptive BN alignment - OPTIMIZED"""
         model.eval()
-        logging.info("开始自适应对齐...")
+        logging.info(f"Starting adaptive alignment (rounds={self.args.adabn_rounds}, "
+                    f"batches={self.args.adabn_batches})...")
         
-        alignment_rounds = 5
-        batches_per_round = 8
-        
-        adabn_layers = [(name, module) for name, module in model.named_modules() 
-                       if isinstance(module, (EMDAdaBN2d, EMDAdaBN3d, EMDAdaBN1d)) 
-                       and module.use_adabn.item()]
-        
-        logging.info(f"发现 {len(adabn_layers)} 个AdaBN层参与适应")
-        
-        for round_idx in range(alignment_rounds):
+        for r in range(self.args.adabn_rounds):
             batch_count = 0
             for inputs, _ in target_loader:
-                if batch_count >= batches_per_round:
+                if batch_count >= self.args.adabn_batches:
                     break
                 
-                inputs = inputs.to(self.device, non_blocking=True)
-                
+                inputs = inputs.to(self.device)
                 with torch.no_grad():
-                    _ = model(inputs, adapt=True, save_source=False)
-                
+                    _ = model(inputs, adapt=True)
                 batch_count += 1
+            
+            if (r + 1) % 3 == 0:
+                logging.info(f"  Alignment round {r+1}/{self.args.adabn_rounds} completed")
         
-        logging.info("自适应对齐完成")
+        logging.info("Alignment completed")
     
-    def finetune_model(self, model, train_loader):
-        """微调模型"""
-        logging.info("开始微调...")
+    def progressive_finetune(self, model, train_loader):
+        """Progressive fine-tuning with staged unfreezing"""
+        logging.info("Starting progressive fine-tuning...")
         
-        # 冻结大部分参数，只微调分类器
+        criterion = nn.CrossEntropyLoss(label_smoothing=self.args.label_smoothing)
+        
+        # Stage 1: Classifier only
+        logging.info("Stage 1: Fine-tuning classifier only")
         for param in model.parameters():
             param.requires_grad = False
-        
-        # 解冻分类器
         for param in model.classifier.parameters():
             param.requires_grad = True
         
-        optimizer = optim.AdamW(
+        optimizer1 = optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
-            lr=self.args.lr * 2.0,  # 分类器使用更高学习率
-            weight_decay=0.01
+            lr=self.args.lr * self.args.ft_lr_multiplier,
+            weight_decay=self.args.weight_decay * 0.5
         )
         
-        criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        self._train_stage(model, train_loader, optimizer1, criterion, 
+                         epochs=self.args.ft_stage1_epochs, stage_name="Stage1")
         
+        # Stage 2: Classifier + Spatial Processor
+        if self.args.ft_stage2_epochs > 0:
+            logging.info("Stage 2: Fine-tuning classifier + spatial_processor")
+            for param in model.spatial_processor.parameters():
+                param.requires_grad = True
+            
+            optimizer2 = optim.AdamW(
+                [p for p in model.parameters() if p.requires_grad],
+                lr=self.args.lr * (self.args.ft_lr_multiplier * 0.8),
+                weight_decay=self.args.weight_decay
+            )
+            
+            self._train_stage(model, train_loader, optimizer2, criterion,
+                            epochs=self.args.ft_stage2_epochs, stage_name="Stage2")
+        
+        # Stage 3: All layers (optional)
+        if self.args.ft_stage3_epochs > 0:
+            logging.info("Stage 3: Fine-tuning all layers")
+            for param in model.parameters():
+                param.requires_grad = True
+            
+            optimizer3 = optim.AdamW(
+                model.parameters(),
+                lr=self.args.lr * (self.args.ft_lr_multiplier * 0.5),
+                weight_decay=self.args.weight_decay * 1.5
+            )
+            
+            # 使用cosine annealing
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer3,
+                T_0=5,
+                T_mult=2,
+                eta_min=self.args.lr * 0.01
+            )
+            
+            self._train_stage(model, train_loader, optimizer3, criterion,
+                            epochs=self.args.ft_stage3_epochs, stage_name="Stage3",
+                            scheduler=scheduler)
+        
+        logging.info("Progressive fine-tuning completed")
+    
+    def _train_stage(self, model, train_loader, optimizer, criterion, epochs, 
+                     stage_name="", scheduler=None):
+        """Train a single stage"""
         model.train()
-        finetune_epochs = 15
         
-        for epoch in range(finetune_epochs):
-            epoch_loss = 0.0
+        for epoch in range(epochs):
+            total_loss = 0
             correct = 0
             total = 0
             
             for inputs, targets in train_loader:
-                inputs = inputs.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
                 
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_norm=self.args.gradient_clip
+                )
                 optimizer.step()
                 
-                epoch_loss += loss.item()
-                _, predicted = outputs.max(1)
+                if scheduler is not None:
+                    scheduler.step()
+                
+                total_loss += loss.item()
+                _, pred = outputs.max(1)
                 total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
+                correct += pred.eq(targets).sum().item()
             
-            if epoch % 3 == 0:
+            if epoch % max(1, epochs // 5) == 0 or epoch == epochs - 1:
                 acc = 100. * correct / total
-                logging.info(f"微调 Epoch {epoch+1:2d}/{finetune_epochs}: Loss={epoch_loss/len(train_loader):.4f}, Acc={acc:.2f}%")
-        
-        logging.info("微调完成")
+                avg_loss = total_loss / len(train_loader)
+                logging.info(f"  {stage_name} Epoch {epoch+1:2d}/{epochs}: "
+                           f"Loss={avg_loss:.4f}, Acc={acc:.2f}%")
     
-    def evaluate_model(self, model, test_loader):
-        """评估模型"""
+    def evaluate(self, model, test_loader):
+        """Evaluate model"""
         model.eval()
-        all_predictions = []
+        all_preds = []
         all_targets = []
         
         with torch.no_grad():
             for inputs, targets in test_loader:
-                inputs = inputs.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
-                
+                inputs = inputs.to(self.device)
                 outputs = model(inputs)
-                _, predicted = outputs.max(1)
+                _, preds = outputs.max(1)
                 
-                all_predictions.extend(predicted.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
+                all_preds.extend(preds.cpu().numpy())
+                all_targets.extend(targets.numpy())
         
-        accuracy = accuracy_score(all_targets, all_predictions)
-        f1 = f1_score(all_targets, all_predictions, average='weighted')
+        accuracy = accuracy_score(all_targets, all_preds)
+        f1 = f1_score(all_targets, all_preds, average='weighted')
         
-        return {
-            'accuracy': accuracy,
-            'f1_score': f1,
-            'predictions': all_predictions,
-            'targets': all_targets
-        }
+        return {'accuracy': accuracy, 'f1_score': f1}
     
-    def run_experiment(self, source_data, target_data, samples_per_class):
-        """运行单次实验"""
-        logging.info(f"开始实验: 每类{samples_per_class}个样本")
+    def run_single_experiment(self, target_data, samples_per_class):
+        """Run single experiment"""
+        logging.info(f"\n{'='*60}")
+        logging.info(f"Experiment: {samples_per_class} samples/class")
+        logging.info(f"{'='*60}")
         
-        # 计算EMD
-        emd_values = self.compute_emd_if_needed(source_data, target_data)
-        logging.info(f"EMD值: {emd_values}")
+        emd_values = self.load_emd_values()
         
-        # 加载模型
-        model = self.load_pretrained_model()
+        model = self.load_source_model()
         if model is None:
             return None
         
-        # 设置EMD值
         model.set_layer_emd_values(emd_values)
         
-        # 采样数据
+        # Sample data
         sampler = FewShotSampler(
-            target_data['spectral'], target_data['labels'], 
-            samples_per_class, test_samples_per_class=200, 
-            num_classes=self.args.num_classes
+            target_data['spectral'],
+            target_data['labels'],
+            samples_per_class,
+            test_samples_per_class=200,
+            num_classes=self.args.num_classes,
+            seed=self.args.seed
         )
         
-        train_data, test_data = sampler.sample_data()
+        train_data, test_data = sampler.sample()
         
         if test_data is None:
-            logging.error("测试数据不足")
+            logging.error("Insufficient test data")
             return None
         
-        # 创建数据加载器
-        batch_size = min(self.args.batch_size, len(train_data['labels']) // 2)
-        batch_size = max(4, batch_size)
+        logging.info(f"Train samples: {len(train_data['labels'])}, "
+                    f"Test samples: {len(test_data['labels'])}")
+        
+        batch_size = max(4, min(self.args.batch_size, len(train_data['labels']) // 2))
         
         train_dataset = SpectralDataset(train_data['spectral'], train_data['labels'])
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True, 
+            num_workers=2,
+            drop_last=True if len(train_dataset) > batch_size else False
+        )
         
         test_dataset = SpectralDataset(test_data['spectral'], test_data['labels'])
-        test_loader = DataLoader(test_dataset, batch_size=self.args.batch_size, shuffle=False, num_workers=2)
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=self.args.batch_size, 
+            shuffle=False, 
+            num_workers=2
+        )
         
-        # 自适应对齐
+        # Adapt and evaluate
         self.adaptive_alignment(model, train_loader)
+        self.progressive_finetune(model, train_loader)
+        results = self.evaluate(model, test_loader)
         
-        # 微调
-        self.finetune_model(model, train_loader)
-        
-        # 评估
-        results = self.evaluate_model(model, test_loader)
-        
-        logging.info(f"结果 - 准确率: {results['accuracy']:.4f}, F1分数: {results['f1_score']:.4f}")
+        logging.info(f"\n{'='*60}")
+        logging.info(f"RESULTS: Accuracy={results['accuracy']:.4f}, F1={results['f1_score']:.4f}")
+        logging.info(f"{'='*60}\n")
         
         return {
             'samples_per_class': samples_per_class,
@@ -448,176 +469,208 @@ class DomainAdapter:
             'emd_values': emd_values
         }
     
-    def run_experiments(self, source_2022_data, source_2024_data):
-        """运行完整实验"""
-        results_2022 = []
-        results_2024 = []
+    def run_experiments(self, target_data):
+        """Run all experiments"""
+        all_results = []
         
-        for samples_per_class in self.args.samples_per_class_list:
-            logging.info(f"\n=== 实验: 每类 {samples_per_class} 个样本 ===")
+        for samples in self.args.samples_list:
+            run_results = []
             
-            # 2022年实验
-            experiment_results_2022 = []
             for run in range(self.args.num_runs):
+                logging.info(f"\n{'#'*70}")
+                logging.info(f"# Run {run+1}/{self.args.num_runs} with {samples} samples/class")
+                logging.info(f"{'#'*70}\n")
+                
                 set_seed(self.args.seed + run)
-                result = self.run_experiment(source_2022_data, source_2022_data, samples_per_class)
+                result = self.run_single_experiment(target_data, samples)
+                
                 if result:
-                    experiment_results_2022.append(result)
+                    run_results.append(result)
+                
                 torch.cuda.empty_cache()
             
-            # 2024年实验
-            experiment_results_2024 = []
-            for run in range(self.args.num_runs):
-                set_seed(self.args.seed + run)
-                result = self.run_experiment(source_2022_data, source_2024_data, samples_per_class)
-                if result:
-                    experiment_results_2024.append(result)
-                torch.cuda.empty_cache()
-            
-            # 计算平均结果
-            if experiment_results_2022:
-                avg_acc_2022 = np.mean([r['accuracy'] for r in experiment_results_2022])
-                std_acc_2022 = np.std([r['accuracy'] for r in experiment_results_2022])
-                results_2022.append({
-                    'samples_per_class': samples_per_class,
-                    'accuracy_mean': avg_acc_2022,
-                    'accuracy_std': std_acc_2022
+            if run_results:
+                avg_acc = np.mean([r['accuracy'] for r in run_results])
+                std_acc = np.std([r['accuracy'] for r in run_results])
+                avg_f1 = np.mean([r['f1_score'] for r in run_results])
+                std_f1 = np.std([r['f1_score'] for r in run_results])
+                
+                all_results.append({
+                    'samples_per_class': samples,
+                    'accuracy_mean': float(avg_acc),
+                    'accuracy_std': float(std_acc),
+                    'f1_mean': float(avg_f1),
+                    'f1_std': float(std_f1),
+                    'num_runs': len(run_results),
+                    'individual_runs': [
+                        {'accuracy': r['accuracy'], 'f1_score': r['f1_score']}
+                        for r in run_results
+                    ]
                 })
-            
-            if experiment_results_2024:
-                avg_acc_2024 = np.mean([r['accuracy'] for r in experiment_results_2024])
-                std_acc_2024 = np.std([r['accuracy'] for r in experiment_results_2024])
-                results_2024.append({
-                    'samples_per_class': samples_per_class,
-                    'accuracy_mean': avg_acc_2024,
-                    'accuracy_std': std_acc_2024
-                })
-            
-            # 输出结果
-            if experiment_results_2022 and experiment_results_2024:
-                diff = avg_acc_2024 - avg_acc_2022
-                logging.info(f"样本数 {samples_per_class}: 2022年={avg_acc_2022:.4f}±{std_acc_2022:.4f}, "
-                           f"2024年={avg_acc_2024:.4f}±{std_acc_2024:.4f}, 差异={diff:+.4f}")
+                
+                logging.info(f"\n{'='*70}")
+                logging.info(f"SUMMARY for {samples} samples/class:")
+                logging.info(f"  Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
+                logging.info(f"  F1-Score: {avg_f1:.4f} ± {std_f1:.4f}")
+                logging.info(f"{'='*70}\n")
         
-        return results_2022, results_2024
+        return all_results
     
-    def save_results(self, results_2022, results_2024):
-        """保存结果"""
-        results = {
-            'results_2022': results_2022,
-            'results_2024': results_2024,
+    def save_results(self, results):
+        """Save results"""
+        output = {
+            'results': results,
             'config': {
-                'emd_threshold': self.emd_config.emd_threshold,
-                'linear_factor': self.emd_config.linear_factor,
-                'max_strength': self.emd_config.max_strength
-            }
+                'source_model': self.args.source_model,
+                'target_data': self.args.target_data,
+                'emd_threshold': self.args.emd_threshold,
+                'emd_linear_factor': self.args.emd_linear_factor,
+                'emd_max_strength': self.args.emd_max_strength,
+                'adabn_rounds': self.args.adabn_rounds,
+                'adabn_batches': self.args.adabn_batches,
+                'ft_lr_multiplier': self.args.ft_lr_multiplier,
+                'ft_stage1_epochs': self.args.ft_stage1_epochs,
+                'ft_stage2_epochs': self.args.ft_stage2_epochs,
+                'ft_stage3_epochs': self.args.ft_stage3_epochs,
+                'num_runs': self.args.num_runs,
+                'seed': self.args.seed
+            },
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         
-        output_file = os.path.join(self.args.output_dir, 'domain_adaptation_results.json')
+        # Save JSON
+        output_file = os.path.join(self.args.output_dir, 'results.json')
         with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+            json.dump(output, f, indent=2)
         
-        # 生成报告
-        report_file = os.path.join(self.args.output_dir, 'results_report.txt')
+        # Save report
+        report_file = os.path.join(self.args.output_dir, 'report.txt')
         with open(report_file, 'w', encoding='utf-8') as f:
-            f.write("EMD指导的域适应结果报告\n")
-            f.write("=" * 40 + "\n\n")
+            f.write("EMD-Guided Domain Adaptation Results (OPTIMIZED)\n")
+            f.write("=" * 70 + "\n\n")
             
-            f.write(f"{'样本数':>6} | {'2022年准确率':>15} | {'2024年准确率':>15} | {'差异':>10}\n")
-            f.write("-" * 60 + "\n")
+            f.write("Configuration:\n")
+            for k, v in output['config'].items():
+                f.write(f"  {k}: {v}\n")
+            f.write("\n")
             
-            for r2022, r2024 in zip(results_2022, results_2024):
-                samples = r2022['samples_per_class']
-                acc_2022 = r2022['accuracy_mean']
-                std_2022 = r2022['accuracy_std']
-                acc_2024 = r2024['accuracy_mean']
-                std_2024 = r2024['accuracy_std']
-                diff = acc_2024 - acc_2022
-                
-                f.write(f"{samples:>6} | {acc_2022:.4f}±{std_2022:.3f} | {acc_2024:.4f}±{std_2024:.3f} | {diff:>+9.4f}\n")
+            f.write("Results:\n")
+            f.write("-" * 70 + "\n")
+            for r in results:
+                f.write(f"\nSamples: {r['samples_per_class']}\n")
+                f.write(f"  Accuracy: {r['accuracy_mean']:.4f} ± {r['accuracy_std']:.4f}\n")
+                f.write(f"  F1-Score: {r['f1_mean']:.4f} ± {r['f1_std']:.4f}\n")
+                f.write(f"  Runs: {r['num_runs']}\n")
         
-        logging.info(f"结果保存至: {self.args.output_dir}")
+        logging.info(f"Results saved to {self.args.output_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='EMD指导的域适应')
+    parser = argparse.ArgumentParser(description='EMD-guided Domain Adaptation (OPTIMIZED)')
     
-    # 数据参数
-    parser.add_argument('--source-2022-data', required=True, help='2022年数据路径')
-    parser.add_argument('--source-2024-data', required=True, help='2024年数据路径')
-    parser.add_argument('--pretrained-model', required=True, help='预训练模型路径')
-    parser.add_argument('--emd-analysis-file', help='EMD分析文件路径(可选)')
+    # Required arguments
+    parser.add_argument('--source-model', required=True, help='Source model path')
+    parser.add_argument('--target-data', required=True, help='Target data path')
+    parser.add_argument('--emd-file', default=None, help='EMD file path')
     
-    # 模型参数
+    # Model config
     parser.add_argument('--num-classes', type=int, default=5)
     parser.add_argument('--num-bands', type=int, default=19)
     
-    # 实验参数
-    parser.add_argument('--samples-per-class-list', nargs='+', type=int, default=[50, 100, 200])
+    # Experiment config
+    parser.add_argument('--samples-list', nargs='+', type=int, default=[50, 100, 200])
     parser.add_argument('--num-runs', type=int, default=3)
     
-    # 训练参数
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=0.0001)
+    # EMD-guided adaptation config (OPTIMIZED)
+    parser.add_argument('--emd-threshold', type=float, default=3.5,
+                       help='EMD threshold for layer selection (default: 3.5)')
+    parser.add_argument('--emd-linear-factor', type=float, default=0.35,
+                       help='Linear factor for adaptation strength (default: 0.35)')
+    parser.add_argument('--emd-max-strength', type=float, default=1.0,
+                       help='Maximum adaptation strength (default: 1.0)')
     
-    # 输出参数
-    parser.add_argument('--output-dir', default='./results')
+    # AdaBN config (OPTIMIZED)
+    parser.add_argument('--adabn-rounds', type=int, default=10,
+                       help='AdaBN alignment rounds (default: 10)')
+    parser.add_argument('--adabn-batches', type=int, default=12,
+                       help='Batches per AdaBN round (default: 12)')
+    
+    # Fine-tuning config (OPTIMIZED)
+    parser.add_argument('--ft-lr-multiplier', type=float, default=5.0,
+                       help='Fine-tuning LR multiplier (default: 5.0)')
+    parser.add_argument('--ft-stage1-epochs', type=int, default=10,
+                       help='Stage 1 (classifier) epochs (default: 10)')
+    parser.add_argument('--ft-stage2-epochs', type=int, default=15,
+                       help='Stage 2 (classifier+spatial) epochs (default: 15)')
+    parser.add_argument('--ft-stage3-epochs', type=int, default=15,
+                       help='Stage 3 (all layers) epochs (default: 15)')
+    
+    # Training config
+    parser.add_argument('--batch-size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=0.0002)
+    parser.add_argument('--weight-decay', type=float, default=0.01)
+    parser.add_argument('--label-smoothing', type=float, default=0.15)
+    parser.add_argument('--gradient-clip', type=float, default=0.5)
+    
+    # Output config
+    parser.add_argument('--output-dir', default='./results_optimized')
     parser.add_argument('--seed', type=int, default=42)
     
     args = parser.parse_args()
     
-    # 设置种子
     set_seed(args.seed)
     
-    # 创建输出目录
+    # Create output directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    args.output_dir = os.path.join(args.output_dir, f"domain_adaptation_{timestamp}")
+    args.output_dir = os.path.join(args.output_dir, f"adaptation_{timestamp}")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 设置日志
-    setup_logging(os.path.join(args.output_dir, 'domain_adaptation.log'))
+    setup_logging(os.path.join(args.output_dir, 'adaptation.log'))
+    
+    # Log configuration
+    logging.info("="*70)
+    logging.info("EMD-GUIDED DOMAIN ADAPTATION - OPTIMIZED VERSION")
+    logging.info("="*70)
+    logging.info("\nConfiguration:")
+    for arg, value in sorted(vars(args).items()):
+        logging.info(f"  {arg}: {value}")
+    logging.info("")
     
     try:
-        # 创建域适应器
         adapter = DomainAdapter(args)
         
-        # 加载数据
-        logging.info("加载数据集...")
-        spectral_2022, labels_2022 = load_npz_dataset(args.source_2022_data)
-        spectral_2024, labels_2024 = load_npz_dataset(args.source_2024_data)
+        # Load target data
+        spectral, labels = load_npz_dataset(args.target_data)
+        if spectral is None:
+            raise ValueError("Failed to load target data")
         
-        if spectral_2022 is None or spectral_2024 is None:
-            raise ValueError("数据加载失败")
+        target_data = {'spectral': spectral, 'labels': labels}
+        logging.info(f"Target data loaded: {len(labels)} samples\n")
         
-        source_2022_data = {'spectral': spectral_2022, 'labels': labels_2022}
-        source_2024_data = {'spectral': spectral_2024, 'labels': labels_2024}
+        # Run experiments
+        results = adapter.run_experiments(target_data)
         
-        logging.info(f"数据加载完成: 2022年{len(labels_2022)}样本, 2024年{len(labels_2024)}样本")
+        # Save results
+        adapter.save_results(results)
         
-        # 运行实验
-        logging.info("开始EMD指导的域适应实验...")
-        results_2022, results_2024 = adapter.run_experiments(source_2022_data, source_2024_data)
-        
-        # 保存结果
-        adapter.save_results(results_2022, results_2024)
-        
-        logging.info(f"实验完成! 结果保存在: {args.output_dir}")
-        
-        # 输出最终结果摘要
-        logging.info("\n=== 结果摘要 ===")
-        for r2022, r2024 in zip(results_2022, results_2024):
-            samples = r2022['samples_per_class']
-            acc_2022 = r2022['accuracy_mean']
-            acc_2024 = r2024['accuracy_mean']
-            diff = acc_2024 - acc_2022
-            
-            logging.info(f"样本数 {samples}: 2022年={acc_2022:.4f}, 2024年={acc_2024:.4f}, 差异={diff:+.4f}")
+        # Final summary
+        logging.info("\n" + "="*70)
+        logging.info("FINAL SUMMARY")
+        logging.info("="*70)
+        for r in results:
+            logging.info(f"Samples {r['samples_per_class']:3d}: "
+                        f"Acc={r['accuracy_mean']:.4f}±{r['accuracy_std']:.4f}, "
+                        f"F1={r['f1_mean']:.4f}±{r['f1_std']:.4f}")
+        logging.info("="*70)
         
     except Exception as e:
-        logging.error(f"实验失败: {e}")
+        logging.error(f"Experiment failed: {e}")
         import traceback
-        logging.error(traceback.format_exc())
+        traceback.print_exc()
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
